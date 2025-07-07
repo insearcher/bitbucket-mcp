@@ -9,6 +9,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import axios, { AxiosInstance } from "axios";
 import winston from "winston";
+import { BitbucketServerAdapter } from "./server-adapter.js";
 
 // =========== LOGGER SETUP ===========
 // Simple logger that only writes to a file (no stdout pollution)
@@ -250,6 +251,12 @@ class BitbucketServer {
       defaultWorkspace: process.env.BITBUCKET_WORKSPACE,
     };
 
+    // For Bitbucket Server, ensure baseUrl doesn't have /rest/api/1.0
+    // The adapter will handle API path transformations
+    if (this.config.baseUrl && !this.config.baseUrl.includes('bitbucket.org')) {
+      this.config.baseUrl = this.config.baseUrl.replace(/\/rest\/api\/\d+\.\d+\/?$/, '');
+    }
+
     // Validate required config
     if (!this.config.baseUrl) {
       throw new Error("BITBUCKET_URL is required");
@@ -272,6 +279,10 @@ class BitbucketServer {
           ? { username: this.config.username, password: this.config.password }
           : undefined,
     });
+
+    // Install Bitbucket Server adapter if needed
+    const adapter = new BitbucketServerAdapter(this.config.baseUrl);
+    adapter.install(this.api);
 
     // Setup tool handlers using the request handler pattern
     this.setupToolHandlers();
