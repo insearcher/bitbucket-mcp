@@ -251,6 +251,17 @@ class BitbucketServer {
       defaultWorkspace: process.env.BITBUCKET_WORKSPACE,
     };
 
+    // Log configuration (mask sensitive data)
+    logger.info('Bitbucket configuration loaded', {
+      baseUrl: this.config.baseUrl,
+      hasToken: !!this.config.token,
+      hasUsername: !!this.config.username,
+      hasPassword: !!this.config.password,
+      username: this.config.username,
+      passwordLength: this.config.password?.length,
+      defaultWorkspace: this.config.defaultWorkspace
+    });
+
     // For Bitbucket Server, ensure baseUrl doesn't have /rest/api/1.0
     // The adapter will handle API path transformations
     if (this.config.baseUrl && !this.config.baseUrl.includes('bitbucket.org')) {
@@ -279,6 +290,35 @@ class BitbucketServer {
           ? { username: this.config.username, password: this.config.password }
           : undefined,
     });
+
+    // Add logging interceptor for debugging
+    this.api.interceptors.request.use((config) => {
+      logger.info('Making request', {
+        url: config.url,
+        method: config.method,
+        hasAuth: !!config.auth,
+        authUser: config.auth?.username,
+        headers: {
+          Authorization: config.headers?.Authorization ? 'Bearer ***' : undefined,
+          'Content-Type': config.headers?.['Content-Type']
+        },
+        baseURL: config.baseURL
+      });
+      return config;
+    });
+
+    this.api.interceptors.response.use(
+      (response) => response,
+      (error) => {
+        logger.error('Request failed', {
+          url: error.config?.url,
+          status: error.response?.status,
+          statusText: error.response?.statusText,
+          data: error.response?.data
+        });
+        return Promise.reject(error);
+      }
+    );
 
     // Install Bitbucket Server adapter if needed
     const adapter = new BitbucketServerAdapter(this.config.baseUrl);
@@ -557,7 +597,7 @@ class BitbucketServer {
         },
         {
           name: "getPullRequestDiff",
-          description: "Get diff for a pull request",
+          description: "Get diff for a pull request (returns summary for large PRs)",
           inputSchema: {
             type: "object",
             properties: {
@@ -569,6 +609,52 @@ class BitbucketServer {
               pull_request_id: {
                 type: "string",
                 description: "Pull request ID",
+              },
+            },
+            required: ["workspace", "repo_slug", "pull_request_id"],
+          },
+        },
+        {
+          name: "getPullRequestDiffForFile",
+          description: "Get diff for a specific file in a pull request",
+          inputSchema: {
+            type: "object",
+            properties: {
+              workspace: {
+                type: "string",
+                description: "Bitbucket workspace name",
+              },
+              repo_slug: { type: "string", description: "Repository slug" },
+              pull_request_id: {
+                type: "string",
+                description: "Pull request ID",
+              },
+              file_path: {
+                type: "string",
+                description: "Path to the file to get diff for",
+              },
+            },
+            required: ["workspace", "repo_slug", "pull_request_id", "file_path"],
+          },
+        },
+        {
+          name: "getPullRequestDiffStat",
+          description: "Get diff statistics for a pull request",
+          inputSchema: {
+            type: "object",
+            properties: {
+              workspace: {
+                type: "string",
+                description: "Bitbucket workspace name",
+              },
+              repo_slug: { type: "string", description: "Repository slug" },
+              pull_request_id: {
+                type: "string",
+                description: "Pull request ID",
+              },
+              limit: {
+                type: "number",
+                description: "Maximum number of files to return (default: 100)",
               },
             },
             required: ["workspace", "repo_slug", "pull_request_id"],
@@ -788,6 +874,19 @@ class BitbucketServer {
             required: ["workspace", "project_key"],
           },
         },
+        {
+          name: "listWorkspaces",
+          description: "List available workspaces/projects (for Bitbucket Server, returns projects)",
+          inputSchema: {
+            type: "object",
+            properties: {
+              limit: {
+                type: "number",
+                description: "Maximum number of workspaces to return (default: 25)",
+              },
+            },
+          },
+        },
       ],
     }));
 
@@ -886,6 +985,20 @@ class BitbucketServer {
               args.repo_slug as string,
               args.pull_request_id as string
             );
+          case "getPullRequestDiffForFile":
+            return await this.getPullRequestDiffForFile(
+              args.workspace as string,
+              args.repo_slug as string,
+              args.pull_request_id as string,
+              args.file_path as string
+            );
+          case "getPullRequestDiffStat":
+            return await this.getPullRequestDiffStat(
+              args.workspace as string,
+              args.repo_slug as string,
+              args.pull_request_id as string,
+              args.limit as number
+            );
           case "getPullRequestCommits":
             return await this.getPullRequestCommits(
               args.workspace as string,
@@ -933,6 +1046,8 @@ class BitbucketServer {
               args.production as Record<string, any>,
               args.branch_types as Array<Record<string, any>>
             );
+          case "listWorkspaces":
+            return await this.listWorkspaces(args.limit as number);
           default:
             throw new McpError(
               ErrorCode.MethodNotFound,
@@ -1493,6 +1608,112 @@ class BitbucketServer {
         pull_request_id,
       });
 
+      // First, try to get the diffstat to check the size
+      let totalFiles = 0;
+      let files = [];
+      
+      try {
+        const diffstatResponse = await this.api.get(
+          `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/diffstat`,
+          {
+            params: {
+              limit: 100, // Get more files for better summary
+            },
+          }
+        );
+        files = diffstatResponse.data.values || [];
+        totalFiles = files.length;
+        
+        logger.info("Diffstat retrieved", {
+          totalFiles,
+          threshold: 30,
+          willReturnSummary: totalFiles > 30
+        });
+      } catch (diffstatError) {
+        logger.warn("Could not get diffstat, will try to get full diff", { 
+          error: diffstatError instanceof Error ? diffstatError.message : String(diffstatError) 
+        });
+        
+        // Try to get the full diff to check its size
+        try {
+          const testResponse = await this.api.get(
+            `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/diff`,
+            {
+              headers: {
+                Accept: "text/plain",
+              },
+              responseType: "text",
+            }
+          );
+          
+          // If diff is too large, return a summary
+          const diffSize = testResponse.data.length;
+          if (diffSize > 50000) { // 50KB threshold
+            logger.warn("Diff too large, returning summary", { diffSize });
+            
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    totalFiles: "unknown",
+                    filesChanged: [],
+                    truncated: true,
+                    message: `This pull request diff is too large (${diffSize} characters). Please use getPullRequestDiffStat to see file statistics or getPullRequestDiffForFile to view specific files.`,
+                    diffSize
+                  }, null, 2),
+                },
+              ],
+            };
+          }
+          
+          // Diff is small enough, return it
+          return {
+            content: [
+              {
+                type: "text",
+                text: testResponse.data,
+              },
+            ],
+          };
+        } catch (diffError) {
+          throw diffError;
+        }
+      }
+      
+      // If there are too many files, return a summary instead
+      if (totalFiles > 30) {
+        logger.warn("Pull request has too many files, returning summary", {
+          totalFiles,
+          workspace,
+          repo_slug,
+          pull_request_id,
+        });
+
+        // Create a summary of changes
+        const summary = {
+          totalFiles,
+          filesChanged: files.slice(0, 30).map((file: any) => ({
+            path: file.new?.path || file.old?.path || "unknown",
+            status: file.status,
+            linesAdded: file.lines_added || 0,
+            linesRemoved: file.lines_removed || 0,
+          })),
+          truncated: true,
+          message: `This pull request contains ${totalFiles} files. Showing first 30 files. To view specific file diffs, use getPullRequestDiffForFile.`,
+        };
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(summary, null, 2),
+            },
+          ],
+        };
+      }
+
+      // For smaller pull requests, get the full diff
       const response = await this.api.get(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/diff`,
         {
@@ -1502,6 +1723,35 @@ class BitbucketServer {
           responseType: "text",
         }
       );
+
+      // Double-check the diff size even for "small" PRs
+      const diffSize = response.data.length;
+      if (diffSize > 50000) { // 50KB threshold
+        logger.warn("Diff still too large despite file count, returning summary", { 
+          diffSize,
+          totalFiles 
+        });
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                totalFiles,
+                filesChanged: files.slice(0, 30).map((file: any) => ({
+                  path: file.new?.path || file.old?.path || "unknown",
+                  status: file.status,
+                  linesAdded: file.lines_added || 0,
+                  linesRemoved: file.lines_removed || 0,
+                })),
+                truncated: true,
+                message: `This pull request diff is too large (${diffSize} characters). Showing first 30 files. To view specific file diffs, use getPullRequestDiffForFile.`,
+                diffSize
+              }, null, 2),
+            },
+          ],
+        };
+      }
 
       return {
         content: [
@@ -1561,6 +1811,175 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get pull request commits: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  }
+
+  async getPullRequestDiffForFile(
+    workspace: string,
+    repo_slug: string,
+    pull_request_id: string,
+    file_path: string
+  ) {
+    try {
+      logger.info("Getting Bitbucket pull request diff for specific file", {
+        workspace,
+        repo_slug,
+        pull_request_id,
+        file_path,
+      });
+
+      // For now, let's get the full diff and extract the file
+      // This is not optimal but works for both Cloud and Server
+      logger.info("Getting full diff to extract file", { file_path });
+      
+      const response = await this.api.get(
+        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/diff`,
+        {
+          headers: {
+            Accept: "text/plain",
+          },
+          responseType: "text",
+          // Don't apply our size limit transformations for this specific case
+          transformResponse: [(data) => data],
+        }
+      );
+
+      const fullDiff = response.data;
+      logger.info("Full diff size", { size: fullDiff.length });
+      
+      // Extract the diff for the specific file
+      // Look for the file header in the diff - handle different formats
+      const escapedPath = file_path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      
+      // Try different patterns used by different git/bitbucket versions
+      const patterns = [
+        // Bitbucket Server format
+        new RegExp(`diff --git src://${escapedPath} dst://${escapedPath}`),
+        new RegExp(`diff --git src://.*/${escapedPath} dst://.*/${escapedPath}`),
+        // Standard git format
+        new RegExp(`diff --git a/${escapedPath} b/${escapedPath}`),
+        new RegExp(`diff --git a/.*${escapedPath} b/.*${escapedPath}`),
+        // Other variations
+        new RegExp(`diff --git.*${escapedPath}.*${escapedPath}`),
+        new RegExp(`--- a/${escapedPath}`),
+        new RegExp(`--- src/${escapedPath}`),
+        new RegExp(`---.*${escapedPath}`)
+      ];
+      
+      let startIndex = -1;
+      for (const pattern of patterns) {
+        startIndex = fullDiff.search(pattern);
+        if (startIndex !== -1) {
+          logger.info("Found file with pattern", { pattern: pattern.source });
+          break;
+        }
+      }
+      
+      if (startIndex === -1) {
+        // Log first few file headers for debugging
+        const fileHeaders = fullDiff.match(/diff --git .*/g);
+        logger.error("File not found. First 5 file headers:", {
+          headers: fileHeaders?.slice(0, 5),
+          searchedFile: file_path
+        });
+        throw new Error(`File ${file_path} not found in pull request diff`);
+      }
+
+      // Find the next file header or end of diff
+      const nextFilePattern = /\ndiff --git/;
+      const endIndex = fullDiff.indexOf('\ndiff --git', startIndex + 1);
+      
+      const fileDiff = endIndex === -1 
+        ? fullDiff.substring(startIndex)
+        : fullDiff.substring(startIndex, endIndex);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: fileDiff.trim(),
+          },
+        ],
+      };
+    } catch (error) {
+      logger.error("Error getting pull request diff for file", {
+        error,
+        workspace,
+        repo_slug,
+        pull_request_id,
+        file_path,
+      });
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to get pull request diff for file: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  }
+
+  async getPullRequestDiffStat(
+    workspace: string,
+    repo_slug: string,
+    pull_request_id: string,
+    limit: number = 100
+  ) {
+    try {
+      logger.info("Getting Bitbucket pull request diff statistics", {
+        workspace,
+        repo_slug,
+        pull_request_id,
+        limit,
+      });
+
+      const response = await this.api.get(
+        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/diffstat`,
+        {
+          params: {
+            limit,
+          },
+        }
+      );
+
+      const files = response.data.values || [];
+      const hasMore = response.data.next ? true : false;
+      
+      // Create a summary of changes
+      const summary = {
+        totalFiles: files.length,
+        hasMore,
+        filesChanged: files.map((file: any) => ({
+          path: file.new?.path || file.old?.path || "unknown",
+          status: file.status,
+          linesAdded: file.lines_added || 0,
+          linesRemoved: file.lines_removed || 0,
+          type: file.new?.type || file.old?.type,
+        })),
+        totalLinesAdded: files.reduce((sum: number, file: any) => sum + (file.lines_added || 0), 0),
+        totalLinesRemoved: files.reduce((sum: number, file: any) => sum + (file.lines_removed || 0), 0),
+      };
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(summary, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      logger.error("Error getting pull request diff statistics", {
+        error,
+        workspace,
+        repo_slug,
+        pull_request_id,
+      });
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to get pull request diff statistics: ${
           error instanceof Error ? error.message : String(error)
         }`
       );
@@ -1840,6 +2259,40 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to update project branching model settings: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  }
+
+  async listWorkspaces(limit: number = 25) {
+    try {
+      logger.info("Listing workspaces/projects", { limit });
+
+      // For Bitbucket Server, we list projects
+      // For Bitbucket Cloud, we would list workspaces
+      const isServer = !this.config.baseUrl.includes('bitbucket.org');
+      
+      const response = await this.api.get(
+        isServer ? '/workspaces' : '/workspaces',
+        {
+          params: { limit },
+        }
+      );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(response.data.values, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      logger.error("Error listing workspaces", { error });
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to list workspaces: ${
           error instanceof Error ? error.message : String(error)
         }`
       );

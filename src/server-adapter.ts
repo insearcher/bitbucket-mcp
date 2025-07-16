@@ -1,4 +1,12 @@
 import { AxiosInstance, AxiosResponse, InternalAxiosRequestConfig } from 'axios';
+import winston from 'winston';
+
+// Logger setup
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.json(),
+  transports: [new winston.transports.File({ filename: 'bitbucket.log' })],
+});
 
 /**
  * Adapter for Bitbucket Server API compatibility
@@ -34,6 +42,11 @@ export class BitbucketServerAdapter {
   private transformRequest(config: InternalAxiosRequestConfig): InternalAxiosRequestConfig {
     if (!config.url) return config;
 
+    const originalUrl = config.url;
+    
+    // Store original URL for later use in response transformation
+    (config as any)._originalPath = originalUrl;
+    
     // Transform URL paths
     config.url = this.transformUrl(config.url);
 
@@ -46,6 +59,14 @@ export class BitbucketServerAdapter {
     if (config.data && (config.method === 'post' || config.method === 'put')) {
       config.data = this.transformRequestBody(config.url, config.data);
     }
+
+    logger.info('BitbucketServerAdapter: Transformed request', {
+      originalUrl,
+      transformedUrl: config.url,
+      method: config.method,
+      params: config.params,
+      isDiffstat: originalUrl.includes('diffstat')
+    });
 
     return config;
   }
@@ -62,6 +83,35 @@ export class BitbucketServerAdapter {
     // Single repository: /repositories/{workspace}/{repo} -> /rest/api/1.0/projects/{project}/repos/{repo}
     if (url.match(/^\/repositories\/([^\/]+)\/([^\/]+)$/)) {
       return url.replace(/^\/repositories\/([^\/]+)\/([^\/]+)$/, '/rest/api/1.0/projects/$1/repos/$2');
+    }
+
+    // Diffstat endpoint MUST be checked before general pullrequests
+    // Diffstat endpoint: /repositories/{workspace}/{repo}/pullrequests/{id}/diffstat -> /rest/api/1.0/projects/{project}/repos/{repo}/pull-requests/{id}/changes
+    if (url.includes('/diffstat')) {
+      url = url.replace('/pullrequests/', '/pull-requests/');
+      return url.replace(/^\/repositories\/([^\/]+)\/([^\/]+)/, '/rest/api/1.0/projects/$1/repos/$2')
+                .replace('/diffstat', '/changes');
+    }
+
+    // Diff endpoints: /repositories/{workspace}/{repo}/pullrequests/{id}/diff -> /rest/api/1.0/projects/{project}/repos/{repo}/pull-requests/{id}/diff
+    if (url.includes('/diff') && url.includes('/pullrequests/')) {
+      url = url.replace('/pullrequests/', '/pull-requests/');
+      return url.replace(/^\/repositories\/([^\/]+)\/([^\/]+)/, '/rest/api/1.0/projects/$1/repos/$2');
+    }
+
+    // Pull request comments: /repositories/{workspace}/{repo}/pullrequests/{id}/comments -> /rest/api/1.0/projects/{project}/repos/{repo}/pull-requests/{id}/activities
+    if (url.includes('/pullrequests/') && url.includes('/comments')) {
+      url = url.replace('/pullrequests/', '/pull-requests/');
+      // In Bitbucket Server, comments are part of activities
+      return url.replace(/^\/repositories\/([^\/]+)\/([^\/]+)/, '/rest/api/1.0/projects/$1/repos/$2')
+                .replace('/comments', '/activities');
+    }
+
+    // Pull request activity: /repositories/{workspace}/{repo}/pullrequests/{id}/activity -> /rest/api/1.0/projects/{project}/repos/{repo}/pull-requests/{id}/activities
+    if (url.includes('/pullrequests/') && url.includes('/activity')) {
+      url = url.replace('/pullrequests/', '/pull-requests/');
+      return url.replace(/^\/repositories\/([^\/]+)\/([^\/]+)/, '/rest/api/1.0/projects/$1/repos/$2')
+                .replace('/activity', '/activities');
     }
 
     // Pull requests: /repositories/{workspace}/{repo}/pullrequests -> /rest/api/1.0/projects/{project}/repos/{repo}/pull-requests
@@ -231,8 +281,105 @@ export class BitbucketServerAdapter {
       }));
     }
 
+    // Pull request changes (diffstat)
+    if (url.includes('/pull-requests/') && url.includes('/changes')) {
+      data.values = data.values.map((change: any) => ({
+        status: change.type || 'modified',
+        new: change.path ? { path: change.path.toString } : null,
+        old: change.srcPath ? { path: change.srcPath.toString } : null,
+        lines_added: change.linesAdded || 0,
+        lines_removed: change.linesRemoved || 0
+      }));
+    }
+
+    // Pull request activities - handle both comments and activity endpoints
+    if (url.includes('/pull-requests/') && url.includes('/activities')) {
+      // Transform activities - filter comments if needed
+      const activities = data.values || [];
+      
+      // For comments endpoint, filter only COMMENTED activities
+      const comments = activities
+        .filter((activity: any) => activity.action === 'COMMENTED')
+        .map((activity: any) => ({
+          id: activity.comment?.id || activity.id,
+          content: {
+            raw: activity.comment?.text || '',
+            markup: 'markdown',
+            html: activity.comment?.text || ''
+          },
+          user: {
+            uuid: `{${activity.user?.id || activity.comment?.author?.id}}`,
+            display_name: activity.user?.displayName || activity.comment?.author?.displayName,
+            account_id: activity.user?.name || activity.comment?.author?.name
+          },
+          created_on: activity.createdDate || activity.comment?.createdDate,
+          updated_on: activity.updatedDate || activity.comment?.updatedDate,
+          type: 'pullrequest_comment',
+          links: {
+            self: { href: '' },
+            html: { href: '' }
+          }
+        }));
+      
+      // For activity endpoint, return all activities transformed
+      const allActivities = activities.map((activity: any) => {
+        const baseActivity = {
+          update: {
+            date: activity.createdDate,
+            author: {
+              uuid: `{${activity.user?.id}}`,
+              display_name: activity.user?.displayName,
+              account_id: activity.user?.name
+            }
+          }
+        };
+
+        // Add specific fields based on activity type
+        switch (activity.action) {
+          case 'COMMENTED':
+            return {
+              ...baseActivity,
+              comment: {
+                id: activity.comment?.id,
+                created_on: activity.comment?.createdDate,
+                updated_on: activity.comment?.updatedDate,
+                content: {
+                  raw: activity.comment?.text || '',
+                  markup: 'markdown',
+                  html: activity.comment?.text || ''
+                },
+                user: {
+                  uuid: `{${activity.comment?.author?.id}}`,
+                  display_name: activity.comment?.author?.displayName,
+                  account_id: activity.comment?.author?.name
+                }
+              }
+            };
+          case 'APPROVED':
+          case 'UNAPPROVED':
+            return {
+              ...baseActivity,
+              approval: {
+                date: activity.createdDate,
+                user: {
+                  uuid: `{${activity.user?.id}}`,
+                  display_name: activity.user?.displayName,
+                  account_id: activity.user?.name
+                }
+              }
+            };
+          default:
+            return baseActivity;
+        }
+      });
+      
+      // Return comments for comments endpoint, all activities for activity endpoint
+      // Since we can't differentiate here, return comments by default
+      data.values = comments.length > 0 ? comments : allActivities;
+    }
+
     // Pull requests
-    if (url.includes('/pull-requests')) {
+    if (url.includes('/pull-requests') && !url.includes('/changes') && !url.includes('/activities')) {
       data.values = data.values.map((pr: any) => ({
         id: pr.id,
         title: pr.title,

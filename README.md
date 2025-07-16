@@ -78,6 +78,8 @@ Configure the server using the following environment variables:
 
 \* Either `BITBUCKET_TOKEN` or both `BITBUCKET_USERNAME` and `BITBUCKET_PASSWORD` must be provided.
 
+> **Note about BITBUCKET_WORKSPACE**: If you set this environment variable, it will be used as the default workspace for all operations. For Bitbucket Server, this should be a project key (e.g., "PROJECT-KEY", "DEV"). If not set, you'll need to specify the workspace parameter in each method call. You can use the `listWorkspaces` method to see available workspaces/projects.
+
 ### Creating a Bitbucket App Password
 
 1. Log in to your Bitbucket account
@@ -130,6 +132,16 @@ If you're developing locally and want to test your changes:
 ## Available Tools
 
 This MCP server provides tools for interacting with Bitbucket repositories and pull requests. Below is a comprehensive list of the available operations:
+
+### Workspace Operations
+
+#### `listWorkspaces`
+
+Lists available workspaces (projects for Bitbucket Server).
+
+**Parameters:**
+
+- `limit` (optional): Maximum number of workspaces to return (default: 25)
 
 ### Repository Operations
 
@@ -356,23 +368,35 @@ Reopens a resolved comment thread on a pull request.
 
 #### `getPullRequestDiff`
 
-Gets the diff for a pull request.
+Gets the diff for a pull request. For large pull requests (>50 files), returns a summary instead of the full diff.
 
 **Parameters:**
 
 - `workspace`: Bitbucket workspace name
 - `repo_slug`: Repository slug
 - `pull_request_id`: Pull request ID
+
+#### `getPullRequestDiffForFile`
+
+Gets the diff for a specific file in a pull request.
+
+**Parameters:**
+
+- `workspace`: Bitbucket workspace name
+- `repo_slug`: Repository slug
+- `pull_request_id`: Pull request ID
+- `file_path`: Path to the file to get diff for
 
 #### `getPullRequestDiffStat`
 
-Gets the diff statistics for a pull request.
+Gets the diff statistics for a pull request with file-by-file breakdown.
 
 **Parameters:**
 
 - `workspace`: Bitbucket workspace name
 - `repo_slug`: Repository slug
 - `pull_request_id`: Pull request ID
+- `limit` (optional): Maximum number of files to return (default: 100)
 
 #### `getPullRequestPatch`
 
@@ -465,6 +489,83 @@ Lists commit statuses for a pull request.
 - `workspace`: Bitbucket workspace name
 - `repo_slug`: Repository slug
 - `pull_request_id`: Pull request ID
+
+## Usage Examples
+
+### Working with Large Pull Requests
+
+When working with pull requests that have many changed files, the MCP server provides intelligent handling:
+
+```javascript
+// Get statistics for a pull request
+const stats = await getPullRequestDiffStat({
+  workspace: 'my-workspace',
+  repo_slug: 'my-repo',
+  pull_request_id: '123'
+});
+// Returns: { totalFiles: 75, totalLinesAdded: 1500, totalLinesRemoved: 300, ... }
+
+// Get diff - automatically returns summary for large PRs
+const diff = await getPullRequestDiff({
+  workspace: 'my-workspace',
+  repo_slug: 'my-repo',
+  pull_request_id: '123'
+});
+// For PRs with >50 files, returns:
+// {
+//   truncated: true,
+//   totalFiles: 75,
+//   filesChanged: [...], // First 50 files
+//   message: "This pull request contains 75 files..."
+// }
+
+// Get diff for a specific file
+const fileDiff = await getPullRequestDiffForFile({
+  workspace: 'my-workspace',
+  repo_slug: 'my-repo',
+  pull_request_id: '123',
+  file_path: 'src/main.js'
+});
+```
+
+### Docker Usage
+
+Run the MCP server in a Docker container:
+
+```bash
+# Build the image
+docker build -t bitbucket-mcp .
+
+# Run with environment variables
+docker run --rm -i \
+  -e BITBUCKET_URL=https://your-bitbucket-server.com \
+  -e BITBUCKET_USERNAME=your-username \
+  -e BITBUCKET_PASSWORD=your-app-password \
+  -e BITBUCKET_WORKSPACE=your-workspace \
+  bitbucket-mcp
+```
+
+### Bitbucket Server Compatibility
+
+The MCP server automatically detects and adapts to Bitbucket Server/Data Center instances:
+- API endpoints are automatically translated
+- Response formats are converted to match Cloud API
+- No additional configuration needed
+
+**Important Note about Workspaces:**
+- For Bitbucket Cloud: workspace = workspace slug (e.g., "my-company")
+- For Bitbucket Server: workspace = project key (e.g., "PROJECT-KEY", "DEV", "PROD")
+
+If you're getting 401 errors on Bitbucket Server, it's likely because:
+1. The workspace parameter should be a valid project key (not a slug)
+2. Project keys are typically uppercase letters, sometimes with hyphens
+
+Use the `listWorkspaces` method to see all available projects:
+```javascript
+// This will show all projects you have access to
+const workspaces = await listWorkspaces();
+// Returns: [{key: "PROJECT-KEY", name: "Project Name"}, ...]
+```
 
 ## Development
 
